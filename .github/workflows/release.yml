@@ -1,0 +1,225 @@
+name: Push Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      short_sha: ${{ steps.release.outputs.short_sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      release_name: ${{ steps.release.outputs.release_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Compute release metadata
+        id: release
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAG="v${VERSION}-${SHORT_SHA}"
+          RELEASE_NAME="Codex ${VERSION} (${SHORT_SHA})"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+
+  build-mac:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Install tools
+        run: |
+          brew install --quiet sevenzip
+
+      - name: Sync upstream (macOS only)
+        run: node scripts/sync-upstream.js --force --skip-win
+
+      - name: Patch
+        run: node scripts/patch-all.js mac-${{ matrix.arch }}
+
+      - name: Build
+        run: npm run build:mac-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codex-macOS-${{ matrix.arch }}
+          path: out/*.dmg
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Install tools
+        run: |
+          choco install 7zip -y
+
+      - name: Add 7zz alias
+        run: |
+          Copy-Item "C:\Program Files\7-Zip\7z.exe" "C:\Program Files\7-Zip\7zz.exe"
+          echo "C:\Program Files\7-Zip" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Sync upstream (Windows only)
+        run: node scripts/sync-upstream.js --force --skip-mac
+
+      - name: Patch
+        run: node scripts/patch-all.js win
+
+      - name: Build
+        run: npm run build:win-x64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codex-Windows-x64
+          path: out/*.zip
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm fakeroot dpkg 7zip
+
+      - name: Sync upstream (macOS ZIP for unix, skip Windows)
+        run: node scripts/sync-upstream.js --force --skip-win
+
+      - name: Patch
+        run: node scripts/patch-all.js mac-${{ matrix.arch }}
+
+      - name: Build
+        run: npm run build:linux-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codex-Linux-${{ matrix.arch }}
+          path: |
+            out/make/deb/**/*.deb
+            out/make/rpm/**/*.rpm
+            out/make/zip/**/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [metadata, build-mac, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Create release tag
+        env:
+          TAG_NAME: ${{ needs.metadata.outputs.tag }}
+          RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
+        run: |
+          git fetch --tags --force
+
+          if git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+            echo "Tag ${TAG_NAME} already exists."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${TAG_NAME}" -m "${RELEASE_NAME}"
+          git push origin "refs/tags/${TAG_NAME}"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -lhR artifacts/
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: ${{ needs.metadata.outputs.release_name }}
+          body: |
+            ## Release
+
+            Source commit: `${{ github.sha }}`
+            Package version: `${{ needs.metadata.outputs.version }}`
+            Short SHA: `${{ needs.metadata.outputs.short_sha }}`
+
+            Built artifacts are generated from the same platform build steps as the manual build workflow.
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.zip
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
+            artifacts/**/*.exe
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
